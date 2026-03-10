@@ -265,6 +265,7 @@ void free_shm_buffer(wf_buffer& buffer)
 
 static bool use_damage = true;
 static bool use_dmabuf = false;
+static bool pending_copy = false;
 static bool use_hwupload = false;
 
 static uint32_t wl_shm_to_drm_format(uint32_t format)
@@ -310,11 +311,7 @@ static void frame_handle_buffer(void *, struct zwlr_screencopy_frame_v1 *frame, 
         exit(EXIT_FAILURE);
     }
 
-    if (use_damage) {
-        zwlr_screencopy_frame_v1_copy_with_damage(frame, buffer.wl_buffer);
-    } else {
-        zwlr_screencopy_frame_v1_copy(frame, buffer.wl_buffer);
-    }
+    pending_copy = true;
 }
 
 static void frame_handle_flags(void*, struct zwlr_screencopy_frame_v1 *, uint32_t flags) {
@@ -439,16 +436,23 @@ static void frame_handle_linux_dmabuf(void *, struct zwlr_screencopy_frame_v1 *f
         zwp_linux_buffer_params_v1_add_listener(buffer.params, &params_listener, frame);
         zwp_linux_buffer_params_v1_create(buffer.params, buffer.width,
             buffer.height, format, 0);
+        pending_copy = false; // dmabuf_created will call copy after bo is ready
     } else {
-        if (use_damage) {
-            zwlr_screencopy_frame_v1_copy_with_damage(frame, buffer.wl_buffer);
-        } else {
-            zwlr_screencopy_frame_v1_copy(frame, buffer.wl_buffer);
-        }
+        pending_copy = true;
     }
 }
 
-static void frame_handle_buffer_done(void *, struct zwlr_screencopy_frame_v1 *) {
+static void frame_handle_buffer_done(void *, struct zwlr_screencopy_frame_v1 *frame) {
+    if (!pending_copy) {
+        return; // dmabuf_created will call copy once the bo is ready
+    }
+    auto& buffer = buffers.capture();
+    if (use_damage) {
+        zwlr_screencopy_frame_v1_copy_with_damage(frame, buffer.wl_buffer);
+    } else {
+        zwlr_screencopy_frame_v1_copy(frame, buffer.wl_buffer);
+    }
+    pending_copy = false;
 }
 
 static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
@@ -1017,6 +1021,7 @@ Examples:)");
 }
 
 capture_region selected_region{};
+bool has_user_region = false;
 wf_recorder_output *chosen_output = nullptr;
 zwlr_screencopy_frame_v1 *frame = NULL;
 
@@ -1027,8 +1032,10 @@ void request_next_frame()
         zwlr_screencopy_frame_v1_destroy(frame);
     }
 
-    /* Capture the whole output if the user hasn't provided a good geometry */
-    if (!selected_region.is_selected())
+    /* For user sub-regions, capture the full output and apply crop via ffmpeg filter.
+     * capture_output_region uses physical pixel coords but slurp gives logical coords,
+     * so we avoid it and do the crop in software instead. */
+    if (has_user_region || !selected_region.is_selected())
     {
         frame = zwlr_screencopy_manager_v1_capture_output(
             screencopy_manager, 1, chosen_output->output);
@@ -1151,6 +1158,7 @@ int main(int argc, char *argv[])
 
             case 'g':
                 selected_region.set_from_string(optarg);
+                has_user_region = true;
                 break;
 
             case 'c':
@@ -1406,6 +1414,27 @@ int main(int argc, char *argv[])
 
         if (!spawned_thread)
         {
+            if (has_user_region)
+            {
+                /* Scale the logical-pixel region to physical-pixel crop coords.
+                 * buffer.width/height are the output's physical dimensions;
+                 * chosen_output->width/height are its logical (xdg-output) dimensions. */
+                double scale_x = (double)buffer.width / chosen_output->width;
+                double scale_y = (double)buffer.height / chosen_output->height;
+                int crop_x = (int)((selected_region.x - chosen_output->x) * scale_x + 0.5);
+                int crop_y = (int)((selected_region.y - chosen_output->y) * scale_y + 0.5);
+                int crop_w = (int)(selected_region.width  * scale_x + 0.5) & ~1;
+                int crop_h = (int)(selected_region.height * scale_y + 0.5) & ~1;
+                std::string crop_filter = "crop=" + std::to_string(crop_w) + ":"
+                    + std::to_string(crop_h) + ":" + std::to_string(crop_x) + ":"
+                    + std::to_string(crop_y);
+                if (params.video_filter == "null") {
+                    params.video_filter = crop_filter;
+                } else {
+                    params.video_filter = crop_filter + "," + params.video_filter;
+                }
+            }
+
             writer_thread = std::thread([=] () {
                 write_loop(params);
             });
